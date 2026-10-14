@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import os
 import shutil
+import importlib.util
 from abc import ABC
 from typing import List, Type
 
@@ -17,13 +18,17 @@ class Platform(ABC):
 
     @staticmethod
     def get_platform_names() -> List[str]:
-        return ['GPU', 'NPU', 'MPS']
+        return ['GPU', 'SUPA', 'NPU', 'MPS']
 
     @staticmethod
     def get_platform(platform: str = None) -> Type['Platform']:
         if platform is None:
             from .mps import is_mps_available
-            if shutil.which('npu-smi'):
+            if importlib.util.find_spec('torch_supa') is not None:
+                from .supa import SUPA, ensure_supa_backend
+                ensure_supa_backend()
+                return SUPA
+            elif shutil.which('npu-smi'):
                 from .npu import NPU, ensure_npu_backend
                 ensure_npu_backend()
                 return NPU
@@ -43,6 +48,10 @@ class Platform(ABC):
             from .npu import NPU, ensure_npu_backend
             ensure_npu_backend()
             return NPU
+        elif platform.upper() in ('SUPA', 'BIREN'):
+            from .supa import SUPA, ensure_supa_backend
+            ensure_supa_backend()
+            return SUPA
         elif platform.upper() == 'MPS':
             from .mps import MPS
             return MPS
