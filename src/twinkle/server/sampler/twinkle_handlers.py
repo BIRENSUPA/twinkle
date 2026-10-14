@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import traceback
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -29,7 +28,7 @@ from twinkle.protocol.serialize import deserialize_object
 from twinkle.protocol.types import sampler as sampler_types
 from twinkle.server.exceptions import EndpointUnavailableError, RequestRejectedError
 from twinkle.server.lifecycle.submit import backend_kwargs, resolve_twinkle_adapter_name, to_backend_inputs
-from twinkle.server.sampler.weights import resolve_sampler_weights
+from twinkle.server.sampler.weights import resolve_sampler_weights, sample_with_weights
 from twinkle.server.task_errors import task_error_payload
 from twinkle.server.telemetry.correlation import MODEL_ID
 from twinkle.server.telemetry.tracing import traced_operation
@@ -163,7 +162,7 @@ async def _stream_queue(q, sentinel, request_id: str, total_timeout: float, sing
             pass
 
 
-async def _await_generation(service: SamplerManagement, submission_id: str, timeout: float):
+async def _await_generation(service: SamplerManagement, submission_id: str):
     """Poll one admitted generation through the backend boundary."""
     collected = False
 
@@ -196,14 +195,14 @@ async def _await_generation(service: SamplerManagement, submission_id: str, time
             poll_interval = min(poll_interval * 1.5, 0.25)
 
     try:
-        return await asyncio.wait_for(poll(), timeout=timeout)
+        return await poll()
     finally:
         if not collected:
+
             try:
-                await asyncio.wait_for(
-                    service.call_backend(service.sampler.cancel_generation, submission_id), timeout=4.0)
+                await service.call_backend(service.sampler.cancel_generation, submission_id)
             except Exception:
-                logger.warning('Failed to cancel generation %s', submission_id, exc_info=True)
+                logger.warning('Failed to clear generation %s', submission_id, exc_info=True)
 
 
 def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], SamplerManagement]) -> None:
@@ -230,7 +229,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
 
         async def _task():
             # Resolve adapter
-            adapter_path = None
+            resolved_uri = None
             adapter_name = body.adapter_name or ''
             full_adapter_name = resolve_twinkle_adapter_name(request, adapter_name) or ''
 
@@ -238,9 +237,6 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 from twinkle.server.checkpoint import create_checkpoint_manager
                 checkpoint_manager = create_checkpoint_manager(token, client_type='twinkle')
                 _, resolved_uri = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
-                # Reset prefix cache only when new weights are loaded.
-                await self.call_backend(self.sampler.reset_prefix_cache)
-                adapter_path = await resolve_sampler_weights(self, resolved_uri)
 
             # Parse inputs (shared seam; batch form)
             inputs = to_backend_inputs(body.inputs)
@@ -251,19 +247,22 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                 params = SamplingParams.from_dict(body.sampling_params)
 
             # Sample
-            responses = await self.call_backend(
-                self.sampler.sample,
-                inputs,
-                params,
-                adapter_name=full_adapter_name,
-                adapter_path=adapter_path,
-            )
+            async def generate(adapter_path):
+                return await self.call_backend(
+                    self.sampler.sample,
+                    inputs,
+                    params,
+                    adapter_name=full_adapter_name,
+                    adapter_path=adapter_path,
+                )
+
+            responses = await sample_with_weights(self, resolved_uri, generate)
             return types.SampleResponseModelList(samples=_to_sample_response_models(responses)).model_dump()
 
         # Calculate metrics for queue scheduling. The body is wire-validated, so the
         # entries are models and ``input_ids`` is absent or a list of ints.
         input_tokens = sum(len(getattr(entry, 'input_ids', None) or ()) for entry in body.inputs)
-        return await self.submit_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
+        return await self.submit_concurrent_and_peek(_task, token=token, input_tokens=input_tokens, task_type='sample')
 
     @app.post('/twinkle/sample_to_data_plane', response_model=types.TaskEnvelope)
     async def sample_to_data_plane(
@@ -298,15 +297,18 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             # vLLM async engine owns generation concurrency, so the whole
             # admit -> await -> store sequence runs as one background future
             # (outside the serial compute queue) and its result is the DataRef.
-            await self.call_backend(
-                self.sampler.submit_generation,
-                submission_id,
-                inputs,
-                params,
-                adapter_name=full_adapter_name,
-                adapter_path=adapter_path,
-            )
-            responses = await _await_generation(self, submission_id, self.task_queue_config.effective_execution_timeout)
+            async def generate():
+                await self.call_backend(
+                    self.sampler.submit_generation,
+                    submission_id,
+                    inputs,
+                    params,
+                    adapter_name=full_adapter_name,
+                    adapter_path=adapter_path,
+                )
+                return await _await_generation(self, submission_id)
+
+            responses = await self.sampling_guard.run(generate)
             rows, tags = _build_rollout_rows_and_tags(
                 _to_sample_response_models(responses),
                 group_ids=body.group_ids,
@@ -316,7 +318,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             ref = await self.data_plane.put([json_safe(item) for item in rows], kind='rollout', tags=tags)
             return ref.model_dump()
 
-        return await self.submit_background_and_peek(
+        return await self.submit_concurrent_and_peek(
             _generate_and_store, model_id=full_adapter_name or None, task_type='sample_to_data_plane')
 
     @app.post('/twinkle/unload_adapter_paths')
@@ -336,7 +338,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             resolved_paths.append(adapter_path)
         unload = getattr(self.sampler, 'unload_adapter_paths', None)
         if unload is not None:
-            await self.call_backend(unload, resolved_paths)
+            await self.sampling_guard.run(lambda: self.call_backend(unload, resolved_paths), exclusive=True)
         return {'status': 'ok'}
 
     @app.post('/twinkle/set_template', response_model=sampler_types.SamplerSetTemplateResponse)
@@ -347,7 +349,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> sampler_types.SamplerSetTemplateResponse:
         """Set the chat template for encoding Trajectory inputs."""
         with traced_operation('sampler.set_template'):
-            await self.call_backend(self.sampler.set_template, body.template_cls, **backend_kwargs(body))
+            await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.set_template, body.template_cls, **backend_kwargs(body)),
+                exclusive=True)
         return sampler_types.SamplerSetTemplateResponse()
 
     @app.post('/twinkle/add_adapter_to_sampler', response_model=sampler_types.SamplerAddAdapterResponse)
@@ -368,7 +372,9 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         config = LoraConfig(**body.config) if isinstance(body.config, dict) else body.config
 
         with traced_operation('sampler.add_adapter_to_sampler', attrs={MODEL_ID: self.model_id}):
-            await self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config)
+            await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.add_adapter_to_sampler, full_adapter_name, config),
+                exclusive=True)
 
         return sampler_types.SamplerAddAdapterResponse(adapter_name=full_adapter_name)
 
@@ -380,7 +386,8 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
     ) -> None:
         patch_cls = deserialize_object(body.patch_cls)
         with traced_operation('sampler.apply_patch'):
-            await self.call_backend(self.sampler.apply_patch, patch_cls, **backend_kwargs(body))
+            await self.sampling_guard.run(
+                lambda: self.call_backend(self.sampler.apply_patch, patch_cls, **backend_kwargs(body)), exclusive=True)
 
     @app.post('/twinkle/sample_stream')
     async def sample_stream(

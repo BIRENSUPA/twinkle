@@ -388,14 +388,15 @@ class VLLMSamplerTQ(vLLMSampler):
                 logger.warning(f'Failed to pre-load LoRA from {local_adapter_path}, '
                                'sampling will proceed without LoRA')
 
-        return await asyncio.gather(*(self._sample_single(
-            feat,
-            sampling_params,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-            logprobs_only=logprobs_only,
-            disable_lora=use_base_model,
-        ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)))
+        return await self._gather_samples(
+            self._sample_single(
+                feat,
+                sampling_params,
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+                logprobs_only=logprobs_only,
+                disable_lora=use_base_model,
+            ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list))
 
     def _on_submission_done(self, submission_id: str):
 

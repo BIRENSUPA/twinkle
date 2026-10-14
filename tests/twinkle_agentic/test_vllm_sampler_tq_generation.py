@@ -256,8 +256,8 @@ def test_server_waiter_admits_later_submission_before_first_finishes() -> None:
     async def run():
         sampler.submit_generation('first')
         sampler.submit_generation('second')
-        first = asyncio.create_task(_await_generation(service, 'first', timeout=5))
-        second = asyncio.create_task(_await_generation(service, 'second', timeout=5))
+        first = asyncio.create_task(_await_generation(service, 'first'))
+        second = asyncio.create_task(_await_generation(service, 'second'))
         while len(sampler.submission_order) < 2:
             await asyncio.sleep(0)
         assert not first.done()
@@ -298,7 +298,7 @@ def test_server_waiter_retries_cancelled_status_poll() -> None:
     sampler = Sampler()
     sampler.submit_generation('submission')
     service = _DirectGenerationService(sampler)
-    result = asyncio.run(_await_generation(service, 'submission', timeout=5))
+    result = asyncio.run(_await_generation(service, 'submission'))
 
     assert result == ['completed']
     assert sampler.status_calls == 2
