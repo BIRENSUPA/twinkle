@@ -1,10 +1,51 @@
 import asyncio
 import pytest
+import pytest_asyncio
 
 from twinkle.server.task_queue.config import TaskQueueConfig
 from twinkle.server.task_queue.mixin import TaskQueueMixin
 from twinkle.server.task_queue.types import UserTaskError
-from twinkle.server.task_queue.worker import ComputeWorker
+from twinkle.server.task_queue.worker import ComputeWorker, _exception_summary
+
+
+def test_exception_summary_prefers_the_wrapped_cause():
+    from ray.exceptions import RayTaskError
+
+    err = RayTaskError(
+        'TwinkleCompatTransformersModel.preflight_loss_inputs',
+        'ray::TwinkleCompatTransformersModel.preflight_loss_inputs() (pid=1, ip=10.0.0.1)',
+        AssertionError('data/mask length mismatch at sample 0'),
+    )
+
+    summary = _exception_summary(err)
+    assert summary.startswith('AssertionError:')
+    assert 'mismatch' in summary
+
+
+def test_exception_summary_keeps_a_deliberate_wrapper_message():
+    """``raise X from e`` is a deliberate message; only Ray's wrapper is unwrapped."""
+
+    class _Rejected(Exception):
+        pass
+
+    try:
+        try:
+            raise ValueError('internal detail')
+        except ValueError as inner:
+            raise _Rejected('adapter_name is required') from inner
+    except _Rejected as outer:
+        summary = _exception_summary(outer)
+
+    assert summary == '_Rejected: adapter_name is required'
+
+
+def test_exception_summary_falls_back_to_the_ray_error_itself():
+    from ray.exceptions import RayTaskError
+
+    err = RayTaskError('Model.step', 'ray::Model.step() (pid=1)', None)
+    summary = _exception_summary(err)
+    assert summary.startswith('RayTaskError')
+    assert 'Model.step' in summary
 
 
 class _DummyState:
@@ -360,3 +401,245 @@ async def test_submit_and_peek_honors_explicit_request_id():
     env = await queue.submit_and_peek(_factory, task_type='step', request_id='req_fixed123')
     assert env.request_id == 'req_fixed123'
     assert env.status == 'completed'
+
+
+@pytest_asyncio.fixture
+async def make_concurrent_queue():
+    """Keep concurrent worker setup and teardown in one place."""
+    queues = []
+
+    def create(config=None):
+        queue = _DummyQueue()
+        if config is not None:
+            queue._task_queue_config = config
+        queue.enable_compute_worker()
+        queues.append(queue)
+        return queue
+
+    yield create
+    for queue in reversed(queues):
+        await queue._compute_worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tasks_run_side_by_side(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    started = []
+    both_started = asyncio.Event()
+
+    async def work(index):
+        started.append(index)
+        if len(started) == 2:
+            both_started.set()
+        # Under serial execution the first task would wait here forever.
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        return {'index': index}
+
+    refs = [
+        await queue.schedule_concurrent_task(lambda i=i: work(i), token='token1', task_type='sample')
+        for i in range(2)
+    ]
+    for _ in range(100):
+        records = [await queue.state.get_future(ref['request_id']) for ref in refs]
+        if all(record['status'] == 'completed' for record in records):
+            break
+        await asyncio.sleep(0.01)
+
+    assert [record['result'] for record in records] == [{'index': 0}, {'index': 1}]
+    # The serial worker loop is never involved.
+    assert queue._compute_worker._worker_task is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_keeps_queue_failure_mapping(make_concurrent_queue):
+    queue = make_concurrent_queue()
+
+    async def work():
+        raise UserTaskError('invalid request')
+
+    await queue.schedule_concurrent_task(work, token='token1')
+    for _ in range(100):
+        failed = [kwargs for args, kwargs in queue.state.records if args[1] == 'failed']
+        if failed:
+            break
+        await asyncio.sleep(0)
+
+    assert [args[1] for args, _ in queue.state.records] == ['pending', 'running', 'failed']
+    failure = failed[-1]['failure']
+    assert failure.reason_code == 'request_rejected'
+    assert failure.attribution == 'user'
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_preflight_rejection_raises_without_writing(make_concurrent_queue):
+    from twinkle.server.exceptions import InputTokensExceededError
+    queue = make_concurrent_queue()
+
+    async def work():
+        raise AssertionError('preflight rejection must not execute the task')
+
+    with pytest.raises(InputTokensExceededError):
+        await queue.schedule_concurrent_task(
+            work, token='token1', input_tokens=queue.task_queue_config.max_input_tokens + 1)
+
+    assert queue.state.records == []
+    assert not queue._compute_worker._detached_tasks
+
+
+@pytest.mark.asyncio
+async def test_worker_stop_cancels_concurrent_task(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def work():
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    await queue.schedule_concurrent_task(work, token='token1')
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(queue._compute_worker.stop(), timeout=1)
+    assert cancelled.is_set()
+    assert not queue._compute_worker._detached_tasks
+
+
+@pytest.mark.asyncio
+async def test_concurrent_capacity_rejects_before_future_write_and_is_reusable(make_concurrent_queue):
+    from twinkle.server.exceptions import ResourceExhaustedError
+    queue = make_concurrent_queue(TaskQueueConfig(concurrent_task_limit=1))
+    release = asyncio.Event()
+
+    async def work():
+        await release.wait()
+        return {'ok': True}
+
+    try:
+        first = await queue.schedule_concurrent_task(work, token='token1')
+        with pytest.raises(ResourceExhaustedError):
+            await queue.schedule_concurrent_task(work, token='token2')
+        assert set(queue.state._latest) == {first['request_id']}
+        release.set()
+        for _ in range(100):
+            if queue._compute_worker._detached_reserved == 0:
+                break
+            await asyncio.sleep(0.001)
+        envelope = await queue.submit_concurrent_and_peek(work, token='token2')
+        assert envelope.status == 'completed'
+    finally:
+        release.set()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reservation_is_released_when_state_write_fails(make_concurrent_queue):
+    queue = make_concurrent_queue()
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError('state unavailable')
+
+    queue.state.store_future_status = fail
+    with pytest.raises(RuntimeError, match='state unavailable'):
+        await queue.schedule_concurrent_task(lambda: asyncio.sleep(0), token='token1')
+    assert queue._compute_worker._detached_reserved == 0
+    assert not queue._compute_worker._detached_tasks
+
+
+@pytest.mark.asyncio
+async def test_stop_between_future_write_and_start_leaves_terminal_record(make_concurrent_queue):
+    from twinkle.server.exceptions import ResourceExhaustedError
+    queue = make_concurrent_queue()
+    original = queue.state.store_future_status
+
+    async def write_then_stop(*args, **kwargs):
+        await original(*args, **kwargs)
+        if args[1] == 'pending':
+            await queue._compute_worker.stop()
+
+    queue.state.store_future_status = write_then_stop
+    with pytest.raises(ResourceExhaustedError):
+        await queue.schedule_concurrent_task(lambda: asyncio.sleep(0), token='token1', request_id='req-stop')
+    assert queue.state._latest['req-stop']['status'] == 'failed'
+    assert queue._compute_worker._detached_reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_before_task_start_leaves_failed_future(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    executed = False
+    async def work():
+        nonlocal executed
+        executed = True
+    ref = await queue.schedule_concurrent_task(work, token='token1')
+    await queue._compute_worker.stop()  # No yield between admission and shutdown.
+    record = queue.state._latest[ref['request_id']]
+    assert record['status'] == 'failed'
+    assert record['failure']['reason_code'] == 'orphaned_replica'
+    assert not executed and queue._compute_worker._detached_reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_preserves_existing_terminal_record(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    entered = asyncio.Event()
+    async def work():
+        entered.set()
+        await asyncio.Event().wait()
+    ref = await queue.schedule_concurrent_task(work, token='token1')
+    await entered.wait()
+    await queue.state.store_future_status(ref['request_id'], 'failed', None, reason='already terminal')
+    record = queue.state._latest[ref['request_id']].copy()
+    await queue._compute_worker.stop()
+    assert queue.state._latest[ref['request_id']] == record
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_running_status_write_leaves_failed_future(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    entered = asyncio.Event()
+    original = queue.state.store_future_status
+    async def write(*args, **kwargs):
+        if args[1] == 'running':
+            entered.set()
+            await asyncio.Event().wait()
+        await original(*args, **kwargs)
+    queue.state.store_future_status = write
+    ref = await queue.schedule_concurrent_task(lambda: asyncio.sleep(0), token='token1')
+    await entered.wait()
+    await queue._compute_worker.stop()
+    record = queue.state._latest[ref['request_id']]
+    assert record['status'] == 'failed'
+    assert record['failure']['reason_code'] == 'orphaned_replica'
+    assert [args[1] for args, _ in queue.state.records] == ['pending', 'failed']
+
+
+@pytest.mark.asyncio
+async def test_cancel_winning_running_write_race_skips_execution(make_concurrent_queue):
+    queue = make_concurrent_queue()
+    executed = False
+    original = queue.state.store_future_status
+
+    async def cancel_before_running(*args, **kwargs):
+        if args[1] == 'running':
+            # Mirror FutureManager: cancel_if_pending wins, then the terminal record refuses 'running'.
+            queue.state._latest[args[0]] = {'status': 'cancelled', 'result': None, 'failure': None}
+            return
+        await original(*args, **kwargs)
+
+    async def work():
+        nonlocal executed
+        executed = True
+        return {'ok': True}
+
+    queue.state.store_future_status = cancel_before_running
+    ref = await queue.schedule_concurrent_task(work, token='token1')
+    for _ in range(100):
+        if queue._compute_worker._detached_reserved == 0:
+            break
+        await asyncio.sleep(0.001)
+
+    assert not executed
+    assert queue.state._latest[ref['request_id']]['status'] == 'cancelled'
+    assert queue._compute_worker._detached_reserved == 0
+    assert not queue._compute_worker._detached_tasks
